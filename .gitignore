@@ -1,3 +1,6 @@
+driver/*.o
+driver/hidtool
+driver/rfsensor-tool
 firmware/cscope.out
 firmware/*.o
 firmware/usbdrv/*.o
