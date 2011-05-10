@@ -1,7 +1,7 @@
 /*
  * main.c
  *
- * Main functions for RFStompbox, a firmware for a USB guitar pedal based
+ * Main functions for RFThermometer, a firmware for a USB thermometer based
  * on vusb.
  *
  * Copyright (C) 2011 Daniel Thompson <daniel@redfelineninja.org.uk> 
@@ -28,6 +28,8 @@
 
 /* ------------------------------------------------------------------------- */
 
+#define lengthof(x) (sizeof(x) / sizeof(x[0]))
+
 #define BUTTON_PORT PORTB       /* PORTx - register for button output */
 #define BUTTON_PIN PINB         /* PINx - register for button input */
 #define BUTTON_BIT PB0          /* bit for button input/output */
@@ -43,331 +45,186 @@
 
 /* ------------------------------------------------------------------------- */
 
-static uchar    reportBuffer[2];    /* buffer for HID reports */
-static uchar    idleRate;           /* in 4 ms units */
-
-static uchar    buttonState;		/*  stores state of button */
-static uchar    buttonStateChanged;     /*  indicates edge detect on button */
+static volatile unsigned int latchedConversion[4];
 
 /* ------------------------------------------------------------------------- */
+/* ----------------------------- USB interface ----------------------------- */
+/* ------------------------------------------------------------------------- */
 
-PROGMEM char usbHidReportDescriptor[USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH] = { /* USB report descriptor */
-    0x05, 0x01,                    // USAGE_PAGE (Generic Desktop)
-    0x09, 0x06,                    // USAGE (Keyboard)
+PROGMEM char usbHidReportDescriptor[22] = {    /* USB report descriptor */
+    0x06, 0x00, 0xff,              // USAGE_PAGE (Generic Desktop)
+    0x09, 0x01,                    // USAGE (Vendor Usage 1)
     0xa1, 0x01,                    // COLLECTION (Application)
-    0x05, 0x07,                    //   USAGE_PAGE (Keyboard)
-    0x19, 0xe0,                    //   USAGE_MINIMUM (Keyboard LeftControl)
-    0x29, 0xe7,                    //   USAGE_MAXIMUM (Keyboard Right GUI)
     0x15, 0x00,                    //   LOGICAL_MINIMUM (0)
-    0x25, 0x01,                    //   LOGICAL_MAXIMUM (1)
-    0x75, 0x01,                    //   REPORT_SIZE (1)
-    0x95, 0x08,                    //   REPORT_COUNT (8)
-    0x81, 0x02,                    //   INPUT (Data,Var,Abs)
-    0x95, 0x01,                    //   REPORT_COUNT (1)
+    0x26, 0xff, 0x00,              //   LOGICAL_MAXIMUM (255)
     0x75, 0x08,                    //   REPORT_SIZE (8)
-    0x25, 0x65,                    //   LOGICAL_MAXIMUM (101)
-    0x19, 0x00,                    //   USAGE_MINIMUM (Reserved (no event indicated))
-    0x29, 0x65,                    //   USAGE_MAXIMUM (Keyboard Application)
-    0x81, 0x00,                    //   INPUT (Data,Ary,Abs)
+    0x95, 0x80,                    //   REPORT_COUNT (128)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
     0xc0                           // END_COLLECTION
 };
-/* We use a simplifed keyboard report descriptor which does not support the
- * boot protocol. We don't allow setting status LEDs and we only allow one
- * simultaneous key press (except modifiers). We can therefore use short
- * 2 byte input reports.
- * The report descriptor has been created with usb.org's "HID Descriptor Tool"
- * which can be downloaded from http://www.usb.org/developers/hidpage/.
- * Redundant entries (such as LOGICAL_MINIMUM and USAGE_PAGE) have been omitted
- * for the second INPUT item.
+/* Since we define only one feature report, we don't use report-IDs (which
+ * would be the first byte of the report). The entire report consists of 128
+ * opaque data bytes.
  */
 
-/* ------------------------------------------------------------------------- */
-
-static void usbSendScanCode(uchar scancode)
-{
-
-	reportBuffer[0] = 0;
-	reportBuffer[1] = scancode;
-
-	usbSetInterrupt(reportBuffer, sizeof(reportBuffer));
-}
+/* The following variables store the status of the current data transfer */
+static uchar    currentAddress;
+static uchar    bytesRemaining;
 
 /* ------------------------------------------------------------------------- */
 
-#define SCANQ_LENGTH 8
-#define SCANQ_MASK (SCANQ_LENGTH-1)
-#define SCANQ_NEXT(x) ((x+1) & SCANQ_MASK)
+static uchar usbGetSensorReport(uchar offset) {
+	if (offset == 1)
+		return OSCCAL;
 
-static uchar scanq[8];
-static uchar scanq_head;
-static uchar scanq_tail;
-static uchar scanq_scancode; /* last trasnsmitted scancode */
+	if (offset >= 2 && offset < 10)
+		return ((uchar *) (&latchedConversion))[offset -2 ];
 
-static void scanqAppend(uchar scancode)
-{
-	uchar next_tail = SCANQ_NEXT(scanq_tail);
-
-	/* don't allow "no key press" to be queued. scanqPoll() will
-	 * automatically insert key up as required and its algorithm
-	 * will fail if "no key press" is queued.
-	 */
-	if (0 == scancode)
-		return; /* send no keys */
-
-	if (next_tail == scanq_head) {
-		/* TODO: need to call error handler here */
-		return;
-	}
-
-	scanq[(int) scanq_tail] = scancode;
-	scanq_tail = next_tail;
-
+	return eeprom_read_byte((uchar *)0 + offset);
 }
 
-static void scanqPoll(void)
+
+/* usbFunctionRead() is called when the host requests a chunk of data from
+ * the device. For more information see the documentation in usbdrv/usbdrv.h.
+ */
+uchar   usbFunctionRead(uchar *data, uchar len)
 {
-	if(!usbInterruptIsReady())
-		return;
+    uchar i;
+    LED_TOGGLE();
 
-	if (scanq_head == scanq_tail) {
-		if (scanq_scancode) {
-			scanq_scancode = 0;
-			usbSendScanCode(0); /* no keys pressed */
-		}
-	} else {
-		uchar scancode = scanq[(int) scanq_head];
+    if(len > bytesRemaining)
+        len = bytesRemaining;
 
-		if (scancode == scanq_scancode) {
-			/* this could loop forever if zero were inserted into the
-			 * queue (scanqAppend() prevents this)
-			 */
-			scanq_scancode = 0;
-			usbSendScanCode(0); /* no keys pressed */
-		} else {
-			scanq_scancode = scancode;
-			usbSendScanCode(scancode);
-			scanq_head = SCANQ_NEXT(scanq_head);
-		}
-	}
+    for (i=0; i<len; i++, currentAddress++)
+	    data[i] = usbGetSensorReport(currentAddress);
+    bytesRemaining -= len;
+	 
+    return len;
 }
 
-/* ------------------------------------------------------------------------- */
-
-#define TICKS_PER_SECOND      ((F_CPU + 1024) / 2048)
-#define TICKS_PER_HUNDREDTH   ((TICKS_PER_SECOND + 50) / 100)
-#define TICKS_PER_MILLISECOND ((TICKS_PER_SECOND + 500) / 1000)
-
-uchar clockHundredths;
-uchar clockMilliseconds;
-
-#define timeAfter(x, y) (((schar) (x - y)) > 0)
-
-static void timerInit(void)
+/* usbFunctionWrite() is called when the host sends a chunk of data to the
+ * device. For more information see the documentation in usbdrv/usbdrv.h.
+ */
+uchar   usbFunctionWrite(uchar *data, uchar len)
 {
-    /* first nibble:  free running clock, no PWM
-     * second nibble: prescale by 2048 (~8 ticks per millisecond)
-     */
-    TCCR1 = UTIL_BIN8(0000, 1100);
-
-    /* syncrhronous clocking mode */
-    /*PLLCSR &= ~_BV(PCKE);*/ /* clear by default */
-}
-
-static void timerPoll(void)
-{
-    static uchar next_hundredth = TICKS_PER_HUNDREDTH;
-    static uchar next_millisecond = TICKS_PER_MILLISECOND;
-
-    while (timeAfter(TCNT1, next_hundredth)) {
-	clockHundredths++;
-	next_hundredth += TICKS_PER_HUNDREDTH;
-    }
-
-    while (timeAfter(TCNT1, next_millisecond)) {
-	clockMilliseconds++;
-	next_millisecond += TICKS_PER_MILLISECOND;
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-
-static void buttonPoll(void)
-{
-    static uchar debounceTimeIsOver;
-    static uchar debounceTimeout;
-
-    uchar tempButtonValue = bit_is_clear(BUTTON_PIN, BUTTON_BIT);
-
-    if (!debounceTimeIsOver)
-	if (timeAfter(clockHundredths, debounceTimeout))
-            debounceTimeIsOver = 1;
-
-    /* trigger a change if status has changed and the debounce-delay is over,
-     * this has good debounce rejection and latency but is subject to
-     * false trigger on electrical noise
-     */
-    if (tempButtonValue != buttonState && debounceTimeIsOver == 1) {
-	/* change button state */
-	buttonState = tempButtonValue;
-	buttonStateChanged = 1;
-
-	/* restart debounce timer */
-	debounceTimeIsOver = 0;
-	debounceTimeout = clockHundredths + 5;
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-
-struct state {
-	uchar next_state;
-	uchar timeout;
-	uchar timeout_state;
-	uchar scancode;
-};
-
-enum {
-	KEYBOARD_NO_EVENT = 0,
-
-	KEYBOARD_1 = 30,
-	KEYBOARD_2,
-	KEYBOARD_3,
-	KEYBOARD_4,
-	KEYBOARD_5,
-	KEYBOARD_6,
-	KEYBOARD_7,
-	KEYBOARD_8,
-	KEYBOARD_9,
-	KEYBOARD_0,
-
-	KEYBOARD_RETURN = 40,
-
-	KEYBOARD_SPACE = 44,
-};
-
-static PROGMEM struct state stateTable[] = {
-#define UP(x) (0x80 | (x))
-#define DN(x) (x)
-	[  0] = { DN(  1),   0,   1, KEYBOARD_NO_EVENT },
-	[  1] = { DN(  2),   0,   0, KEYBOARD_SPACE },
-	[  2] = { UP(  1), 100,   3, KEYBOARD_NO_EVENT },
-	[  3] = { DN(  4),   0,   0, KEYBOARD_RETURN },
-	[  4] = { UP(  5), 100,   1, KEYBOARD_NO_EVENT },
-	[  5] = { DN(  6),  40,   3, KEYBOARD_RETURN },
-	[  6] = { UP(  7), 100,   1, KEYBOARD_1 },
-	[  7] = { DN(  8),   0,   0, KEYBOARD_RETURN },
-	[  8] = { UP(  9), 100,   1, KEYBOARD_NO_EVENT },
-	[  9] = { DN( 10),  40,   7, KEYBOARD_RETURN },
-	[ 10] = { UP(  3), 100,   1, KEYBOARD_2 },
-#undef UP
-#undef DN
-};
-
-static union { struct state current; uint32_t raw; } state;
-static uchar stateWaitForButton;
-static uchar stateTimeout;
-
-static void stateMachineSwitchTo(uchar stateId)
-{
-	state.raw = pgm_read_dword(stateTable + stateId);
-
-	/* handle transient states early */
-	while (0 == state.current.next_state &&
-	       0 == state.current.timeout) {
-		scanqAppend(state.current.scancode);
-
-		state.raw = pgm_read_dword(stateTable + state.current.timeout_state);
-        }
-
-	/* figure out what button state we are waiting for (and clear the marker bit) */
-	stateWaitForButton = !(state.current.next_state & _BV(7));
-	state.current.next_state &= ~_BV(7);
-
-	/* calculate the timeout action (this may be a nop) */
-	stateTimeout = clockHundredths + state.current.timeout;
-
-}
-
-static void stateMachineInit(void)
-{
-	stateMachineSwitchTo(1);
-}
-
-static void stateMachinePoll(void)
-{
-	/* check for timeout first */
-	if (state.current.timeout &&
-	    timeAfter(clockHundredths, stateTimeout)) {
-		if (0 == state.current.next_state &&
-		    0 != state.current.scancode)
-			scanqAppend(state.current.scancode);
-
-		stateMachineSwitchTo(state.current.timeout_state);
-	}
-
-	/* check for state change due to button */
-	if (buttonStateChanged &&
-	    0 != state.current.next_state &&
-	    (buttonState == stateWaitForButton)) {
-		if (0 != state.current.scancode)
-			scanqAppend(state.current.scancode);
-	
-		stateMachineSwitchTo(state.current.next_state);
-	}
-	buttonStateChanged = 0;
-
-}
-
-/* ------------------------------------------------------------------------- */
-
-static void testPoll(void)
-{
-#if 0
-    /* show (in humane units) that the tick rate is correctly calculated */
-    static uchar ledTimeout;
-
-    if (timeAfter(clockHundredths, ledTimeout)) {
-	ledTimeout += 100; /* two second duty cycle */
 	LED_TOGGLE();
-    }
-#endif
+    if(bytesRemaining == 0)
+        return 1;               /* end of transfer */
+    if(len > bytesRemaining)
+        len = bytesRemaining;
+    eeprom_write_block(data, (uchar *)0 + currentAddress, len);
+    currentAddress += len;
+    bytesRemaining -= len;
+    return bytesRemaining == 0; /* return 1 if this was the last chunk */
 }
 
-/* -------------------------------------------------------------------------------- */
-/* ------------------------ interface to USB driver ------------------------ */
-/* -------------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
 
-uchar	usbFunctionSetup(uchar data[8])
+usbMsgLen_t usbFunctionSetup(uchar data[8])
 {
 usbRequest_t    *rq = (void *)data;
 
-    usbMsgPtr = reportBuffer;
-    if((rq->bmRequestType & USBRQ_TYPE_MASK) == USBRQ_TYPE_CLASS){    /* class request type */
+    if((rq->bmRequestType & USBRQ_TYPE_MASK) == USBRQ_TYPE_CLASS){    /* HID class request */
         if(rq->bRequest == USBRQ_HID_GET_REPORT){  /* wValue: ReportType (highbyte), ReportID (lowbyte) */
-            /* we only have one report type, so don't look at wValue */
-            /* buildReport(); */
-            return sizeof(reportBuffer);
-        }else if(rq->bRequest == USBRQ_HID_GET_IDLE){
-            usbMsgPtr = &idleRate;
-            return 1;
-        }else if(rq->bRequest == USBRQ_HID_SET_IDLE){
-            idleRate = rq->wValue.bytes[1];
+            /* since we have only one report type, we can ignore the report-ID */
+            bytesRemaining = 128;
+            currentAddress = 0;
+            return USB_NO_MSG;  /* use usbFunctionRead() to obtain data */
+        }else if(rq->bRequest == USBRQ_HID_SET_REPORT){
+            /* since we have only one report type, we can ignore the report-ID */
+            bytesRemaining = 128;
+            currentAddress = 0;
+            return USB_NO_MSG;  /* use usbFunctionWrite() to receive data from host */
         }
     }else{
-        /* no vendor specific requests implemented */
+        /* ignore vendor type requests, we don't use any */
     }
-	return 0;
+    return 0;
 }
 
-void    hadUsbReset(void)
+void hadUsbReset(void)
 {
+    const uchar threshold = 2;
+
+    uchar oldcal, newcal;
+
     cli();
     calibrateOscillator();
     sei();
 
-    /* store the calibrated value in EEPROM if it has changed */
-    if (eeprom_read_byte(0) != OSCCAL)
+    oldcal = eeprom_read_byte(0);
+    newcal = OSCCAL;
+
+    /* store the calibrated value in EEPROM if it has changed by more
+     * than the threshold
+     */    
+    if (((oldcal > newcal) && ((oldcal - newcal) > threshold)) ||
+	((oldcal < newcal) && ((newcal - oldcal) > threshold)))
         eeprom_write_byte(0, OSCCAL);
+}
+
+/* ------------------------------------------------------------------------- */
+
+#define ADC_START_CONVERSION() (ADCSRA |= _BV(ADSC))
+#define ADC_IS_BUSY()  (ADCSRA & _BV(ADSC))
+
+static void adcInit(void)
+{
+	/* enable ADC, not free running, interrupt disable, rate = 1/128 */	
+	ADCSRA = UTIL_BIN8(1000, 0111);
+
+	/* must match muxval[0] (from adcPoll) */
+	ADMUX = UTIL_BIN8(1000, 1111);
+	
+	/* kick off the first conversion */
+	ADC_START_CONVERSION();
+}
+
+static void adcPoll(void)
+{
+	static uchar state = 0;
+	static uchar discard = 1;
+
+	static const uchar muxval[] = {
+		UTIL_BIN8(1000, 1111), /* Vref=1.1V, ADC4 (temp sensor) */
+		UTIL_BIN8(1000, 0001), /* Vref=1.1V, ADC1 (PB2) */
+		UTIL_BIN8(1001, 0001), /* Vref=2.56V, ADC1 (PB2) */
+		UTIL_BIN8(0000, 0001), /* Vref=3.3V, ADC1 (PB2) */
+	};
+	
+
+	if (!ADC_IS_BUSY()) {
+		if (discard) {
+			/* discard this result and start again */
+			ADC_START_CONVERSION();
+			discard = 0;
+		} else {
+			/* conversion is complete */
+			/*cli();*/
+			if (!bytesRemaining)
+				latchedConversion[state] = ADC;
+			/*sei();*/
+			
+			/* whether we did the write or not if the latched value
+			 * matches we're done (note also that we've moved most
+			 * of the work outside the interrupt lock)
+			 */
+			if (latchedConversion[state] == ADC) {
+				/* switch to next state */
+				state++;
+				if (state >= lengthof(muxval))
+					state = 0;
+				
+				/* reprogram the ADC (making sure we discard
+				 * the next value)
+				 */
+				ADMUX = muxval[state];
+				ADC_START_CONVERSION();
+				discard = 1;
+			}
+		}
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -384,8 +241,8 @@ uchar   calibrationValue;
         OSCCAL = calibrationValue;
     }
     
-	//odDebugInit();
     usbInit();
+    adcInit();
 
     usbDeviceDisconnect();  /* enforce re-enumeration, do this while interrupts are disabled! */
     i = 0;
@@ -401,20 +258,15 @@ uchar   calibrationValue;
 	/* turn on internal pull-up resistor for the switch */
     BUTTON_PORT |= _BV(BUTTON_BIT);
 
-    stateMachineInit();
-    timerInit();
-
     sei();
 
     for(;;){    /* main event loop */
         wdt_reset();
         usbPoll();
-	buttonPoll();
-	stateMachinePoll();
-	scanqPoll();
-	timerPoll();
-	testPoll();
+	adcPoll();
     }
 
     return 0;
 }
+
+/* ------------------------------------------------------------------------- */
