@@ -4,7 +4,8 @@
  * Main functions for RFThermometer, a firmware for a USB thermometer based
  * on vusb.
  *
- * Copyright (C) 2011 Daniel Thompson <daniel@redfelineninja.org.uk> 
+ * Copyright (C) 2011 Daniel Thompson <daniel@redfelineninja.org.uk>
+ * Copyright (C) 2008 by OBJECTIVE DEVELOPMENT Software GmbH
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,7 +20,9 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <util/delay.h>
+
 #include <stdlib.h>
+#include <string.h>
 
 #include "usbdrv.h"
 #include "oddebug.h"
@@ -45,7 +48,18 @@
 
 /* ------------------------------------------------------------------------- */
 
-static volatile unsigned int latchedConversion[4];
+static const uchar conversionTable[] = {
+	UTIL_BIN8(1000, 1111), /* Vref=1.1V, ADC4 (temp sensor) */
+	UTIL_BIN8(1000, 0001), /* Vref=1.1V, ADC1 (PB2) */
+	UTIL_BIN8(1001, 0001), /* Vref=2.56V, ADC1 (PB2) */
+	UTIL_BIN8(0000, 0001), /* Vref=3.3V, ADC1 (PB2) */
+};
+
+static volatile struct {
+	unsigned int current[lengthof(conversionTable)];
+	unsigned int min[lengthof(conversionTable)];
+	unsigned int max[lengthof(conversionTable)];
+} conversion;
 
 /* ------------------------------------------------------------------------- */
 /* ----------------------------- USB interface ----------------------------- */
@@ -78,8 +92,8 @@ static uchar usbGetSensorReport(uchar offset) {
 	if (offset == 1)
 		return OSCCAL;
 
-	if (offset >= 2 && offset < 10)
-		return ((uchar *) (&latchedConversion))[offset -2 ];
+	if (offset >= 2 && offset < 26)
+		return ((uchar *) (&conversion))[offset - 2];
 
 	return eeprom_read_byte((uchar *)0 + offset);
 }
@@ -91,7 +105,6 @@ static uchar usbGetSensorReport(uchar offset) {
 uchar   usbFunctionRead(uchar *data, uchar len)
 {
     uchar i;
-    LED_TOGGLE();
 
     if(len > bytesRemaining)
         len = bytesRemaining;
@@ -108,15 +121,39 @@ uchar   usbFunctionRead(uchar *data, uchar len)
  */
 uchar   usbFunctionWrite(uchar *data, uchar len)
 {
-	LED_TOGGLE();
     if(bytesRemaining == 0)
-        return 1;               /* end of transfer */
+        return 1; /* end of transfer */
+
     if(len > bytesRemaining)
         len = bytesRemaining;
-    eeprom_write_block(data, (uchar *)0 + currentAddress, len);
-    currentAddress += len;
-    bytesRemaining -= len;
-    return bytesRemaining == 0; /* return 1 if this was the last chunk */
+
+    /* handle the nop and RAM based addresses */
+    while (len != 0 && currentAddress < 26) {
+        /* ignore 0 and 1 (write not allowed to those) */
+	
+	if (currentAddress >= 2)	    
+	    ((uchar *) (&conversion))[currentAddress - 2] = *data;
+
+	data++;
+	len--;
+	currentAddress++;
+	bytesRemaining--;    
+    }
+
+    /* program the EEPROM based addresses. the driver always sends 128 bytes
+     * (i.e. tries to alters EEPROM addresses) even when no changes have been
+     * made so we must use eeprom_update_block() to prevent excessive EEPROM
+     * wear.
+     */
+    if (len != 0) {
+	    eeprom_update_block(data, (uchar *)0 + currentAddress, len);
+
+	    currentAddress += len;
+	    bytesRemaining -= len;
+    }
+
+    /* return 1 if this was the last chunk */
+    return bytesRemaining == 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -171,57 +208,53 @@ void hadUsbReset(void)
 
 static void adcInit(void)
 {
+	memset((void *) conversion.min, 0xff, sizeof(conversion.min));
+
 	/* enable ADC, not free running, interrupt disable, rate = 1/128 */	
 	ADCSRA = UTIL_BIN8(1000, 0111);
 
-	/* must match muxval[0] (from adcPoll) */
-	ADMUX = UTIL_BIN8(1000, 1111);
-	
 	/* kick off the first conversion */
+	ADMUX = conversionTable[0];
 	ADC_START_CONVERSION();
 }
 
 static void adcPoll(void)
 {
 	static uchar state = 0;
-	static uchar discard = 1;
-
-	static const uchar muxval[] = {
-		UTIL_BIN8(1000, 1111), /* Vref=1.1V, ADC4 (temp sensor) */
-		UTIL_BIN8(1000, 0001), /* Vref=1.1V, ADC1 (PB2) */
-		UTIL_BIN8(1001, 0001), /* Vref=2.56V, ADC1 (PB2) */
-		UTIL_BIN8(0000, 0001), /* Vref=3.3V, ADC1 (PB2) */
-	};
-	
+	static uchar keepResult = 0;
 
 	if (!ADC_IS_BUSY()) {
-		if (discard) {
+		if (!keepResult) {
 			/* discard this result and start again */
 			ADC_START_CONVERSION();
-			discard = 0;
+			keepResult = 1;
 		} else {
 			/* conversion is complete */
-			/*cli();*/
-			if (!bytesRemaining)
-				latchedConversion[state] = ADC;
-			/*sei();*/
+			if (!bytesRemaining) {
+				conversion.current[state] = ADC;
+				
+				if (conversion.min[state] > ADC)
+					conversion.min[state] = ADC;
+
+				if (conversion.max[state] < ADC)
+					conversion.max[state] = ADC;
+			}
 			
 			/* whether we did the write or not if the latched value
-			 * matches we're done (note also that we've moved most
-			 * of the work outside the interrupt lock)
+			 * matches we're done
 			 */
-			if (latchedConversion[state] == ADC) {
+			if (conversion.current[state] == ADC) {
 				/* switch to next state */
 				state++;
-				if (state >= lengthof(muxval))
+				if (state >= lengthof(conversionTable))
 					state = 0;
 				
 				/* reprogram the ADC (making sure we discard
 				 * the next value)
 				 */
-				ADMUX = muxval[state];
+				ADMUX = conversionTable[state];
 				ADC_START_CONVERSION();
-				discard = 1;
+				keepResult = 0;
 			}
 		}
 	}
