@@ -8,6 +8,9 @@
  * This Revision: $Id: hidtool.c 723 2009-03-16 19:04:32Z cs $
  */
 
+#define _GNU_SOURCE
+
+#include <getopt.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -42,6 +45,12 @@ typedef struct {
 
 	rfsense_calibration_t calib[ID_MAX];
 } rfsense_state_t;
+
+typedef struct {
+	double current[ID_MAX];
+	double min[ID_MAX];
+	double max[ID_MAX];
+} rfsense_units_t;
 
 /* ------------------------------------------------------------------------- */
 
@@ -99,6 +108,22 @@ void rfsense_decode(const uint8_t *report, rfsense_state_t *state)
 #undef R16
 }
 
+void rfsense_state_to_units(const rfsense_state_t *state,
+			    const rfsense_calibration_t *calib,
+			    rfsense_units_t *units)
+{
+	int i;
+
+	if (NULL == calib)
+		calib = state->calib;
+
+	for (i=0; i<ID_MAX; i++) {
+		units->current[i] = rfsense_get_unit(state->current[i], &calib[i]);
+		units->min[i] = rfsense_get_unit(state->min[i], &calib[i]);
+		units->max[i] = rfsense_get_unit(state->max[i], &calib[i]);
+	}		
+}
+
 void rfsense_encode(const rfsense_state_t *state, uint8_t *report)
 {
 #define W8(offset, val) (report[offset] = val)
@@ -123,28 +148,33 @@ void rfsense_encode(const rfsense_state_t *state, uint8_t *report)
 #undef W16
 }
 
+void _rfsense_print(uint16_t *adc, double *unit, FILE *fp)
+{
+	fprintf(fp, "%5d (%4.2f)  ", adc[ID_INTERNAL], unit[ID_INTERNAL]);
+	fprintf(fp, "%5d (%4.2f)  ", adc[ID_EXTERNAL_1_1], unit[ID_EXTERNAL_1_1]);
+	fprintf(fp, "%5d (%4.2f)  ", adc[ID_EXTERNAL_2_56], unit[ID_EXTERNAL_2_56]);
+	fprintf(fp, "%5d (%4.2f)\n", adc[ID_EXTERNAL_3_3], unit[ID_EXTERNAL_3_3]);
+	
+}
+
 void rfsense_print(rfsense_state_t *state, FILE *fp)
 {
-	double internal = rfsense_get_unit(state->current[ID_INTERNAL],
-					   &state->calib[ID_INTERNAL]);
-	double ext_1_1 = rfsense_get_unit(state->current[ID_EXTERNAL_1_1],
-					  &state->calib[ID_EXTERNAL_1_1]);
-	double ext_2_56 = rfsense_get_unit(state->current[ID_EXTERNAL_2_56],
-					  &state->calib[ID_EXTERNAL_2_56]);
-	double ext_3_3 = rfsense_get_unit(state->current[ID_EXTERNAL_3_3],
-					  &state->calib[ID_EXTERNAL_3_3]);
+	rfsense_units_t units;
+
+	rfsense_state_to_units(state, NULL, &units);
+
 
 	fprintf(fp, "OSCCAL: Actual 0x%02x  Stored 0x%02x\n",
 		state->osccal_actual, state->osccal_boot);
 
-	fprintf(fp, "Internal:        %5d  (%3.2f)\n",
-		state->current[ID_INTERNAL], internal);
-	fprintf(fp, "External (1.1):  %5d  (%3.2f)\n",
-		state->current[ID_EXTERNAL_1_1], ext_1_1);
-	fprintf(fp, "External (2.56): %5d  (%3.2f)\n",
-		state->current[ID_EXTERNAL_2_56], ext_2_56);
-	fprintf(fp, "External (3.3):  %5d  (%3.2f)\n",
-		state->current[ID_EXTERNAL_3_3], ext_3_3);
+	fprintf(fp, "Current:  ");
+	_rfsense_print(state->current, units.current, fp);
+
+        fprintf(fp, "Minimum:  ");
+	_rfsense_print(state->min, units.min, fp);
+
+	fprintf(fp, "Maximum:  ");
+	_rfsense_print(state->max, units.max, fp);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -254,6 +284,10 @@ int         err;
 	rfsense_state_t state;
 
 	rfsense_decode(buffer+1, &state);
+
+	/* restore factory calibration */
+	memcpy(state.calib, rfsense_temp, sizeof(state.calib));
+
 	rfsense_encode(&state, buffer+1);
 	hexdump(buffer+1, sizeof(buffer)-1);
 
