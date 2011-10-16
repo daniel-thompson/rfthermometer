@@ -10,9 +10,12 @@
 
 #define _GNU_SOURCE
 
+#include <assert.h>
+#include <ctype.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include "hiddata.h"
@@ -25,7 +28,8 @@ typedef enum {
 	ID_EXTERNAL_1_1,
 	ID_EXTERNAL_2_56,
 	ID_EXTERNAL_3_3,
-	ID_MAX
+	ID_MAX,
+	ID_INVALID,
 } rfsense_id_t;
 
 typedef struct {
@@ -62,7 +66,7 @@ rfsense_calibration_t rfsense_volts[ID_MAX] = {
 };
 
 rfsense_calibration_t rfsense_temp[ID_MAX] = {
-	{ 300, 2500, 370, 8500 }, /* ATTinyx5 datasheet */
+	{ 300, 2500, 370, 9500 }, /* ATTinyx5 datasheet */
 	{ 372,    0, 934, 3100 }, /* MCP9701(A) */
 	{ 160,    0, 401, 3100 }, /* MCP9701(A) */
 	{ 124,    0, 311, 3100 }  /* MCP9701(A) */
@@ -148,33 +152,78 @@ void rfsense_encode(const rfsense_state_t *state, uint8_t *report)
 #undef W16
 }
 
-void _rfsense_print(uint16_t *adc, double *unit, FILE *fp)
+/**
+ * Perform single ended calibration using the current temperature as the ADC reference.
+ */
+void rfsense_set_temp(rfsense_state_t *state, int temp)
 {
-	fprintf(fp, "%5d (%4.2f)  ", adc[ID_INTERNAL], unit[ID_INTERNAL]);
-	fprintf(fp, "%5d (%4.2f)  ", adc[ID_EXTERNAL_1_1], unit[ID_EXTERNAL_1_1]);
-	fprintf(fp, "%5d (%4.2f)  ", adc[ID_EXTERNAL_2_56], unit[ID_EXTERNAL_2_56]);
-	fprintf(fp, "%5d (%4.2f)\n", adc[ID_EXTERNAL_3_3], unit[ID_EXTERNAL_3_3]);
-	
+	temp *= 100;
+
+	state->calib[ID_INTERNAL].minunit = temp;
+	state->calib[ID_INTERNAL].minadc = state->current[ID_INTERNAL];
+	state->calib[ID_INTERNAL].maxunit = temp + 2000;
+	state->calib[ID_INTERNAL].maxadc = state->current[ID_INTERNAL] + 20;
+
+	// this one can overflow easily so we go down rather than up
+	state->calib[ID_EXTERNAL_1_1].minunit = temp - 800;
+	state->calib[ID_EXTERNAL_1_1].minadc = state->current[ID_EXTERNAL_1_1] - 145;
+	state->calib[ID_EXTERNAL_1_1].maxunit = temp;
+	state->calib[ID_EXTERNAL_1_1].maxadc = state->current[ID_EXTERNAL_1_1];
+
+	state->calib[ID_EXTERNAL_2_56].minunit = temp;
+	state->calib[ID_EXTERNAL_2_56].minadc = state->current[ID_EXTERNAL_2_56];
+	state->calib[ID_EXTERNAL_2_56].maxunit = temp + 2200;
+	state->calib[ID_EXTERNAL_2_56].maxadc = state->current[ID_EXTERNAL_2_56] + 171;
+
+	state->calib[ID_EXTERNAL_3_3].minunit = temp;
+	state->calib[ID_EXTERNAL_3_3].minadc = state->current[ID_EXTERNAL_3_3];
+	state->calib[ID_EXTERNAL_3_3].maxunit = temp + 3100;
+	state->calib[ID_EXTERNAL_3_3].maxadc = state->current[ID_EXTERNAL_3_3] + 187;
 }
 
-void rfsense_print(rfsense_state_t *state, FILE *fp)
+void _rfsense_print_raw(uint16_t *adc, double *unit, FILE *fp)
+{
+	fprintf(fp, "%5d (%5.2f)  ", adc[ID_INTERNAL], unit[ID_INTERNAL]);
+	fprintf(fp, "%5d (%5.2f)  ", adc[ID_EXTERNAL_1_1], unit[ID_EXTERNAL_1_1]);
+	fprintf(fp, "%5d (%5.2f)  ", adc[ID_EXTERNAL_2_56], unit[ID_EXTERNAL_2_56]);
+	fprintf(fp, "%5d (%5.2f)\n", adc[ID_EXTERNAL_3_3], unit[ID_EXTERNAL_3_3]);
+}
+
+void rfsense_print_raw(rfsense_state_t *state, FILE *fp)
 {
 	rfsense_units_t units;
-
 	rfsense_state_to_units(state, NULL, &units);
 
 
-	fprintf(fp, "OSCCAL: Actual 0x%02x  Stored 0x%02x\n",
+	fprintf(fp, "OSCCAL:     Actual 0x%02x    Stored 0x%02x\n",
 		state->osccal_actual, state->osccal_boot);
 
 	fprintf(fp, "Current:  ");
-	_rfsense_print(state->current, units.current, fp);
+	_rfsense_print_raw(state->current, units.current, fp);
 
         fprintf(fp, "Minimum:  ");
-	_rfsense_print(state->min, units.min, fp);
+	_rfsense_print_raw(state->min, units.min, fp);
 
 	fprintf(fp, "Maximum:  ");
-	_rfsense_print(state->max, units.max, fp);
+	_rfsense_print_raw(state->max, units.max, fp);
+}
+
+/**
+ * Display the results from a sensor.
+ *
+ * Note the, unlike the raw results, we only show one decimal place.
+ * This is to avoid "tricking" the user about the precision offered
+ * by the hardware.
+ */
+void rfsense_print(rfsense_state_t *state, rfsense_id_t id, FILE *fp)
+{
+	assert(id < ID_MAX);
+
+	rfsense_units_t units;
+	rfsense_state_to_units(state, NULL, &units);
+
+	fprintf(fp, "%4.1f        Min %4.1f    Max %4.1f\n",
+			units.current[id], units.min[id], units.max[id]);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -231,6 +280,7 @@ FILE    *fp = stdout;
         fprintf(fp, "\n");
 }
 
+#if 0
 static int  hexread(uint8_t *buffer, char *string, int buflen)
 {
 char    *s;
@@ -242,73 +292,282 @@ int     pos = 0;
     }
     return pos;
 }
+#endif
 
 /* ------------------------------------------------------------------------- */
 
 
 
-static void usage(char *myName)
+static void issue_help(char *myName)
 {
-    fprintf(stderr, "usage:\n");
-    fprintf(stderr, "  %s read\n", myName);
-    fprintf(stderr, "  %s write <listofbytes>\n", myName);
+	printf(
+"Usage: %s [OPTION]...\n"
+"Driver for the RFThermometer. Shows the current temperature by\n"
+"default but can also be used to calibrate the device using both\n"
+"single and double ended methods\n"
+"\n"
+"Mandatory arguments to long options are mandatory for short options too.\n"
+"  -c, --calibrate=SENSOR:MIN:MAX:MINADC:MAXADC\n"
+"                             calibrate a specific sensor using the supplied\n"
+"                             range (e.g. --calibrate=2v:20:52:440:508 ).\n"
+"                             Sensor names are: int, 1v, 2v and 3v\n"
+"      --factory-calibration  adopt factory calibration\n"
+"  -h, --help                 display this help and exit\n"
+"  -r, --reset                reset the min/max values\n"
+"  -s, --show=SENSOR          show results measured with SENSOR (default: 3v)\n"
+"  -H, --show-hex             show the raw hex packet exchanged with hardware\n"
+"  -R, --show-raw             show the raw decimal values read from the h/ware\n"
+"      --single-ended=TEMP    perform fast single ended calibration based on\n"
+"                             the current temperature (leave time to warm up)\n"
+"      --unsafe               enable operations that write to devices EEPROM\n"
+"\n",
+	       myName);
+}
+
+static rfsense_id_t unpack_id(const char *sid)
+{
+	if (0 == strcmp(sid, "int")) {
+		return ID_INTERNAL;
+	} else if (0 == strcmp(sid, "1v")) {
+		return ID_EXTERNAL_1_1;
+	} else if (0 == strcmp(sid, "2v")) {
+		return ID_EXTERNAL_2_56;
+	} else if (0 == strcmp(sid, "3v")) {
+		return ID_EXTERNAL_3_3;
+	}
+
+	return ID_INVALID;
+}
+
+static int unpack_calibration(const char *s, rfsense_id_t *idp, rfsense_calibration_t *calibration)
+{
+	char buf[80]; // this is very generous
+	char delim[] = ":, ";
+	int len;
+	char *sid, *smin, *smax, *sminadc, *smaxadc, *snull;
+	rfsense_id_t id;
+
+	len = strlen(s) + 1;
+	if (len > sizeof(buf))
+		return -1;
+
+	memcpy(buf, s, len);
+
+	sid = strtok(buf, delim);
+	smin = strtok(NULL, delim);
+	smax = strtok(NULL, delim);
+	sminadc = strtok(NULL, delim);
+	smaxadc = strtok(NULL, delim);
+	snull = strtok(NULL, delim);
+
+	if (smaxadc == NULL || snull != NULL)
+		return -1;
+
+	if (!isdigit(smin[0]) || !isdigit(smax[0]) || !isdigit(sminadc[0]) || !isdigit(smaxadc[0]))
+		return -1;
+
+	id = unpack_id(sid);
+	if (id == ID_INVALID)
+		return -1;
+
+	// success guaranteed after this point so wecan start modifying the
+	// out parameters
+
+	*idp = id;
+	calibration->minunit = atof(smin) * 100.0;
+	calibration->minadc = atoi(sminadc);
+	calibration->maxunit = atof(smax) * 100.0;
+	calibration->maxadc = atoi(smaxadc);
+
+#if 0
+	printf("%s -> %d   %s -> %d   %s -> %d   %s -> %d   %s -> %d\n",
+		sid, *id,
+		smin, calibration->minunit, sminadc, calibration->minadc,
+		smax, calibration->maxunit, smaxadc, calibration->maxadc);
+#endif
+	return 0;
 }
 
 int main(int argc, char **argv)
 {
-usbDevice_t *dev;
-uint8_t     buffer[129];    /* room for dummy report ID */
-int len = sizeof(buffer);
-int         err;
+	enum {
+		OPT_FC = 256,
+		OPT_SINGLE,
+		OPT_UNSAFE,
+	};
 
-    if(argc < 2){
-        usage(argv[0]);
-        exit(1);
-    }
-    if((dev = openDevice()) == NULL)
-        exit(1);
-    if((err = usbhidGetReport(dev, 0, (char *) buffer, &len)) != 0) {
-         fprintf(stderr, "error reading data: %s\n", usbErrorMessage(err));
-	 exit(2);
-    }
+	static struct option long_options[] = {
+		{ "calibrate", 1, 0, 'c' },
+		{ "factory-calibration", 0, 0, OPT_FC },
+		{ "help", 0, 0, 'h' },
+		{ "reset", 0, 0, 'r' },
+		{ "single-ended", 1, 0, OPT_SINGLE },
+		{ "show", 1, 0, 's' },
+		{ "show-hex", 0, 0, 'H' },
+		{ "show-raw", 0, 0, 'R' },
+		{ "unsafe", 0, 0, OPT_UNSAFE },
+	};
 
-    if(strcasecmp(argv[1], "read") == 0){
+	int opt;
+
+	/* arguments */
+	rfsense_id_t calibrate = ID_INVALID;
+	bool factory_calibration = false;
+	bool reset = false;
+	rfsense_id_t show = ID_INVALID;
+	bool show_raw = false;
+	bool show_hex = false;
+	bool single_ended = false;
+	bool unsafe = false;
+
+	int  calibration_point = 20;
+	rfsense_calibration_t calibration;
+	
+	/* derived arguments */
+	bool bad_args = false;
+	bool do_write = false;
+
+	usbDevice_t *dev;
+	uint8_t     buffer[129];    /* room for dummy report ID */
+	int len = sizeof(buffer);
+	int         err;
 	rfsense_state_t state;
 
-	hexdump(buffer + 1, sizeof(buffer) - 1);
+	while ((opt = getopt_long(argc, argv, "chrs:HR", long_options, NULL)) != -1) {
+		switch (opt) {
+		case 'c': // --calibrate
+			if (0 != unpack_calibration(optarg, &calibrate, &calibration)) {
+				fprintf(stderr, "Bad calibration set: '%s'\n", optarg);
+				bad_args = true;
+			}
+			break;
+
+		case OPT_FC: // --factory-calibration
+			factory_calibration = true;
+			break;
+
+		case 'h': // --help
+			issue_help(argv[0]);
+			exit(0);
+			break;
+
+		case 'r': // --reset
+			reset = true;
+			break;
+
+		case 's': // --show=SENSOR
+			show = unpack_id(optarg);
+			if (ID_INVALID == show) {
+				fprintf(stderr, "Bad sensor name: '%s'\n", optarg);
+				bad_args = true;
+			}
+			break;
+
+		case 'H': // --show-hex
+			show_hex = true;
+			break;
+
+		case 'R': // --show-raw
+			show_raw = true;
+			break;
+
+		case OPT_SINGLE: // --single-ended
+			single_ended = true;
+			if (isdigit(optarg[0])) {
+				calibration_point = atoi(optarg);
+			} else {
+				fprintf(stderr, "Bad calibration point: '%s'\n", optarg);
+				bad_args = true;
+			}
+			break;
+	
+		case OPT_UNSAFE: // --unsafe
+			unsafe = true;
+			break;
+
+		default:
+			fprintf(stderr, "Try '%s --help' for more information.\n",
+				argv[0]);
+			return 1;
+		}
+	}
+
+	if (optind < argc && bad_args) {
+		if (!bad_args)
+			fprintf(stderr, "%s: Too many arguments\n", argv[0]);
+		fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+		return 2;
+	}
+
+	if((dev = openDevice()) == NULL)
+		return 3;
+
+	if((err = usbhidGetReport(dev, 0, (char *) buffer, &len)) != 0) {
+		fprintf(stderr, "error reading data: %s\n", usbErrorMessage(err));
+		return 4;
+	}
 
 	rfsense_decode(buffer+1, &state);
-	rfsense_print(&state, stdout);
-		
-    } else if(strcasecmp(argv[1], "write") == 0){
-	rfsense_state_t state;
 
-	rfsense_decode(buffer+1, &state);
+	if (reset) {
+		memset(state.min, 0xff, sizeof(state.min));
+		memset(state.max, 0, sizeof(state.max));
+	       
+		do_write = true;
+	}
 
-	/* restore factory calibration */
-	memcpy(state.calib, rfsense_temp, sizeof(state.calib));
+	if (factory_calibration) {
+		if (!unsafe) {
+			fprintf(stderr, "Factory calibration will destroy data, requires --unsafe\n");
+		} else {
+			memcpy(state.calib, rfsense_temp, sizeof(state.calib));
+			do_write = true;
+		}
+	}
 
-	rfsense_encode(&state, buffer+1);
-	hexdump(buffer+1, sizeof(buffer)-1);
+	if (single_ended) {
+		if (!unsafe) {
+			fprintf(stderr, "Single ended calibration will destroy data, requires --unsafe\n");
+		} else {
+			rfsense_set_temp(&state, calibration_point);
+			do_write = true;
+		}
+	}
 
-#if 0
-        int i, pos;
-        memset(buffer, 0, sizeof(buffer));
+	if (calibrate != ID_INVALID) {
+		if (!unsafe) {
+			fprintf(stderr, "Calibration destroys existing values, requires --unsafe\n");
+		} else {
+			state.calib[calibrate] = calibration;
+			do_write = true;
+		}
+	}
 
-        for(pos = 1, i = 2; i < argc && pos < sizeof(buffer); i++){
-            pos += hexread(buffer + pos, argv[i], sizeof(buffer) - pos);
-        }
-#endif
+	if (do_write) {
+		rfsense_encode(&state, buffer+1);
 
-        if((err = usbhidSetReport(dev, buffer, sizeof(buffer))) != 0)   /* add a dummy report ID */
-            fprintf(stderr, "error writing data: %s\n", usbErrorMessage(err));
+		if((err = usbhidSetReport(dev, buffer, sizeof(buffer))) != 0)
+			fprintf(stderr, "error writing data: %s\n",
+				usbErrorMessage(err));
+	}
 
-    }else{
-        usage(argv[0]);
-        exit(1);
-    }
-    usbhidCloseDevice(dev);
-    return 0;
+	// we've now finished interacting with the USB device
+	usbhidCloseDevice(dev);
+
+	// select a default display mode if not other activity was requested
+	if (!do_write && !reset && !show_raw && !show_hex && show == ID_INVALID)
+		show = ID_EXTERNAL_3_3;
+
+	if (show_raw)
+		rfsense_print_raw(&state, stdout);
+
+	if (show_hex)
+		hexdump(buffer+1, sizeof(buffer)-1);
+
+	if (show != ID_INVALID)
+		rfsense_print(&state, show, stdout);
+
+	return 0;
 }
 
 /* ------------------------------------------------------------------------- */
