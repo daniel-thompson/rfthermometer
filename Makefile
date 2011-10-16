@@ -14,6 +14,7 @@
 
 all flash fuse readcal clean :
 	$(MAKE) -C firmware $@
+	$(MAKE) -C driver $@
 
 
 VERSION = $(shell grep '[0-9]:$$' ChangeLog | head -n 1 | cut -f1 -d:)

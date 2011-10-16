@@ -29,6 +29,9 @@ PROGRAM=	hidtool$(EXE_SUFFIX)
 
 all: $(PROGRAM)
 
+# Ignore these (the only make sense for the firmware)
+flash fuse readcal:
+
 $(PROGRAM): $(OBJ)
 	$(CC) -o $(PROGRAM) $(OBJ) $(LIBS)
 
