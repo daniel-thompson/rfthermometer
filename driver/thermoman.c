@@ -1,11 +1,15 @@
-/* Name: hidtool.c
- * Project: hid-data example
- * Author: Christian Starkjohann
- * Creation Date: 2008-04-11
- * Tabsize: 4
- * Copyright: (c) 2008 by OBJECTIVE DEVELOPMENT Software GmbH
- * License: GNU GPL v2 (see License.txt), GNU GPL v3 or proprietary (CommercialLicense.txt)
- * This Revision: $Id: hidtool.c 723 2009-03-16 19:04:32Z cs $
+/*
+ * thermoman.c
+ *
+ * Main functions for thermoman, a driver for a USB thermometer
+ *
+ * Copyright (C) 2011 Daniel Thompson <daniel@redfelineninja.org.uk>
+ * Copyright (C) 2008 OBJECTIVE DEVELOPMENT Software GmbH
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  */
 
 #define _GNU_SOURCE

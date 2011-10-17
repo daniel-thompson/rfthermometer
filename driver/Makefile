@@ -24,8 +24,8 @@ CC=				gcc
 CFLAGS=			-O -Wall $(USBFLAGS)
 LIBS=			$(USBLIBS)
 
-OBJ=		hidtool.o hiddata.o
-PROGRAM=	hidtool$(EXE_SUFFIX)
+OBJ=		thermoman.o hiddata.o
+PROGRAM=	thermoman$(EXE_SUFFIX)
 
 all: $(PROGRAM)
 
