@@ -1,6 +1,10 @@
 ChangeLog
 =========
 
+0.6:
+- Rename hidtool to thermoman (thermometer manager)
+- Update the README.
+
 0.5:
- - Initial release.
+- Initial release.
 
